@@ -1,0 +1,77 @@
+# 起動用 workflow。VM を作る・消すだけ。設定は直書きで、入力は create / delete の 2 択だけ。
+name: worker-vm
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "create（作る）か delete（消す）"
+        type: choice
+        options: [create, delete]
+        required: true
+        default: create
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: gcp-worker-vm
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: hq-worker          # ★ ①の「PROJECT_ID: …」の行に置き換える
+  PROJECT_NUMBER: "176582849341"    # ★ ①の「PROJECT_NUMBER: "…"」の行に置き換える
+  ZONE: us-central1-a
+  VM_NAME: gcp-worker-s2
+
+jobs:
+  vm:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: GCP に鍵なしで入る
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-launcher/providers/launcher-main
+          service_account: vm-launcher@${{ env.PROJECT_ID }}.iam.gserviceaccount.com
+
+      - name: gcloud を用意する
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: VM を作る（段1と同じ設定・1 台まで）
+        if: inputs.action == 'create'
+        run: |
+          set -euo pipefail
+          n=$(gcloud compute instances list --project="$PROJECT_ID" \
+                --filter="labels.role=gcp-worker" --format="value(name)" | wc -l)
+          if [ "$n" -ne 0 ]; then
+            echo "::error::gcp-worker の VM がすでに ${n} 台ある。先に delete を実行する"
+            exit 1
+          fi
+          gcloud compute instances create "$VM_NAME" --project="$PROJECT_ID" \
+            --zone="$ZONE" \
+            --machine-type=e2-standard-2 \
+            --max-run-duration=4h \
+            --instance-termination-action=DELETE \
+            --no-service-account --no-scopes \
+            --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud \
+            --boot-disk-size=30GB --boot-disk-type=pd-balanced \
+            --shielded-secure-boot \
+            --labels=role=gcp-worker
+          gcloud compute instances describe "$VM_NAME" --project="$PROJECT_ID" --zone="$ZONE" \
+            --format="yaml(name,machineType,scheduling.maxRunDuration,scheduling.instanceTerminationAction,serviceAccounts,disks[].autoDelete,labels)"
+
+      - name: VM を消す（ディスクごと）
+        if: inputs.action == 'delete'
+        run: |
+          set -euo pipefail
+          if gcloud compute instances describe "$VM_NAME" --project="$PROJECT_ID" --zone="$ZONE" >/dev/null 2>&1; then
+            gcloud compute instances delete "$VM_NAME" --project="$PROJECT_ID" --zone="$ZONE" \
+              --delete-disks=all --quiet
+          else
+            echo "VM はもう無い（4 時間の上限で消えたか、未作成）"
+          fi
+          echo "残り:"
+          gcloud compute instances list --project="$PROJECT_ID" --filter="labels.role=gcp-worker" --format="value(name)"
